@@ -100,7 +100,7 @@ jobs:
       - name: Build Windows x64 candidate (no game tests)
         shell: pwsh
         run: |
-          .\scripts\build.ps1 -Architecture x64 -SkipTests -DestinationSuffix '-1312-test'
+          .\scripts\build.ps1 -Architecture x64 -SkipTests -DestinationSuffix '-1312test'
           if ($LASTEXITCODE -ne 0) { throw 'GDCompanion build failed.' }
 
       - name: Upload unverified executable package
