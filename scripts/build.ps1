@@ -26,7 +26,7 @@ $env:APPDATA = Join-Path $root '.dotnet-home\AppData\Roaming'
 $env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE = '1'
 $env:DOTNET_CLI_TELEMETRY_OPTOUT = '1'
 
-& $devShell -Arch $Architecture -HostArch amd64 -SkipAutomaticLocation
+& $devShell -Arch $(if ($Architecture -eq 'x64') { 'amd64' } else { $Architecture }) -HostArch amd64 -SkipAutomaticLocation
 & $cmake -S (Join-Path $source 'GrimDawnBridge') -B $nativeBuild -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" "-DCMAKE_BUILD_TYPE=$Configuration"
 if ($LASTEXITCODE -ne 0) { throw 'Native bridge configuration failed.' }
 & $cmake --build $nativeBuild --config $Configuration
