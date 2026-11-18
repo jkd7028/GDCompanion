@@ -1,0 +1,112 @@
+name: GDCompanion 1.3.1.2 radar candidate (x64)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-x64:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Apply radar-only 1.3.1.2 source patch
+        shell: pwsh
+        run: |
+          $patchText = @'
+          diff --git a/src/GrimDawnBridge/MinimapProjection.h b/src/GrimDawnBridge/MinimapProjection.h
+          index 61bd7e6..d3fbf13 100644
+          --- a/src/GrimDawnBridge/MinimapProjection.h
+          +++ b/src/GrimDawnBridge/MinimapProjection.h
+          @@ -67,6 +67,18 @@ namespace MinimapProjection
+                           renderRva = 0x1769A0;
+                           mapVtableRva = 0x3159E0;
+                       }
+          +            else if (SupportedBuilds::ExactIdentity(reinterpret_cast<HMODULE>(executable), 0x6AF77535, 0x485000) &&
+          +                // 1.3.1.2: fingerprints from the user's loaded x64 executable,
+          +                // not the Steam-protected on-disk .text section.
+          +                Fingerprint(0x176C10, 0x410, 0xE1F7913DBFDD2586ULL) &&
+          +                Fingerprint(0x175F70, 0x470, 0x34500D8D8917A636ULL))
+          +            {
+          +                // The candidate map vtable has Map's destructor, render and
+          +                // update methods at adjacent slots. The Sample() object/layout
+          +                // guards must still pass in-game; otherwise radar remains off.
+          +                renderRva = 0x176C10;
+          +                mapVtableRva = 0x316AA0;
+          +            }
+                       supported = project && worldCtor && worldPosition && renderRva && mapVtableRva &&
+                           dos->e_magic == IMAGE_DOS_SIGNATURE && pe->Signature == IMAGE_NT_SIGNATURE;
+                   }
+          diff --git a/src/GrimDawnBridge/RadarCanvas.h b/src/GrimDawnBridge/RadarCanvas.h
+          index f07cc5b..ab156ec 100644
+          --- a/src/GrimDawnBridge/RadarCanvas.h
+          +++ b/src/GrimDawnBridge/RadarCanvas.h
+          @@ -114,7 +114,11 @@ namespace RadarCanvas
+               }
+               inline void Initialize(HMODULE engine)
+               {
+          -        if (!MinimapProjection::available || SupportedBuilds::Engine(engine) == SupportedBuilds::Build::Unknown) return;
+          +        // 1.3.1.2 is admitted for the radar canvas only; character-changing
+          +        // utilities retain their independently audited SupportedBuilds gates.
+          +        if (!MinimapProjection::available ||
+          +            (SupportedBuilds::Engine(engine) == SupportedBuilds::Build::Unknown &&
+          +             !SupportedBuilds::ExactIdentity(engine, 0x6AF7742E, 0x450000))) return;
+                   fan = reinterpret_cast<FanFn>(GetProcAddress(engine, "?RenderTriFan@GraphicsCanvas@GAME@@QEAAXAEBV?$vector@VVec2@GAME@@@mem@@AEBVColor@2@@Z"));
+                   rectangle = reinterpret_cast<RectFn>(GetProcAddress(engine, "?RenderRect@GraphicsCanvas@GAME@@QEAAXAEBVRect@2@AEBVColor@2@@Z"));
+                   text = reinterpret_cast<TextFn>(GetProcAddress(engine, "?RenderColoredText2d@GraphicsCanvas@GAME@@QEAAXHHAEBV?$basic_string@GU?$char_traits@G@std@@V?$allocator@G@2@@std@@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@4@AEBVColor@2@W4FontLayout@2@@Z"));
+          diff --git a/src/GrimDawnBridge/SupportedBuilds.h b/src/GrimDawnBridge/SupportedBuilds.h
+          index 389d7b4..560549e 100644
+          --- a/src/GrimDawnBridge/SupportedBuilds.h
+          +++ b/src/GrimDawnBridge/SupportedBuilds.h
+          @@ -23,6 +23,21 @@ namespace SupportedBuilds
+                   return Build::Unknown;
+               }
+           
+          +    // A narrowly scoped identity check for a feature that has independently
+          +    // verified code/layout guards. Do not add a new global Build enum value
+          +    // until all other architecture-specific capabilities have been audited.
+          +    inline bool ExactIdentity(HMODULE module, DWORD timestamp, DWORD imageSize)
+          +    {
+          +        if (!module) return false;
+          +        const auto bytes = reinterpret_cast<const unsigned char*>(module);
+          +        const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(bytes);
+          +        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+          +        const auto pe = reinterpret_cast<const IMAGE_NT_HEADERS64*>(bytes + dos->e_lfanew);
+          +        return pe->Signature == IMAGE_NT_SIGNATURE &&
+          +            pe->FileHeader.TimeDateStamp == timestamp &&
+          +            pe->OptionalHeader.SizeOfImage == imageSize;
+          +    }
+          +
+               inline Build Executable(HMODULE module) { return Identify(module, 0x6A85FBEC, 0x482000, 0x6AC7F680, 0x482000); }
+               inline Build Engine(HMODULE module) { return Identify(module, 0x6A85FB5B, 0x450000, 0x6AC7F5F7, 0x450000); }
+               inline Build Game(HMODULE module) { return Identify(module, 0x6A85FBB3, 0xAB5000, 0x6AC7F64B, 0xAE6000); }
+          '@
+          $patchPath = Join-Path $env:RUNNER_TEMP 'gdcompanion-1312-radar.patch'
+          [System.IO.File]::WriteAllText($patchPath, $patchText + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+          git apply --check $patchPath
+          if ($LASTEXITCODE -ne 0) { throw 'Radar patch does not match this source revision.' }
+          git apply $patchPath
+          if ($LASTEXITCODE -ne 0) { throw 'Could not apply radar patch.' }
+
+      - name: Build Windows x64 candidate (no game tests)
+        shell: pwsh
+        run: |
+          .\scripts\build.ps1 -Architecture x64 -SkipTests -DestinationSuffix '-1312-test'
+          if ($LASTEXITCODE -ne 0) { throw 'GDCompanion build failed.' }
+
+      - name: Upload unverified executable package
+        uses: actions/upload-artifact@v4
+        with:
+          name: GDCompanion-1.3.1.2-radar-only-UNVERIFIED
+          path: build/GDCompanion-v2.3.94-win-x64.zip
+          if-no-files-found: error
+          retention-days: 14
