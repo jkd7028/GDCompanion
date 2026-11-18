@@ -41,7 +41,7 @@ jobs:
           +                // update methods at adjacent slots. The Sample() object/layout
           +                // guards must still pass in-game; otherwise radar remains off.
           +                renderRva = 0x176C10;
-          +                mapVtableRva = 0x316AA0;
+          +                mapVtableRva = 0x316A90;
           +            }
                        supported = project && worldCtor && worldPosition && renderRva && mapVtableRva &&
                            dos->e_magic == IMAGE_DOS_SIGNATURE && pe->Signature == IMAGE_NT_SIGNATURE;
