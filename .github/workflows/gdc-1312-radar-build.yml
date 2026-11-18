@@ -94,3 +94,170 @@ jobs:
           [System.IO.File]::WriteAllText($patchPath, $patchText + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
           git apply --check $patchPath
           if ($LASTEXITCODE -ne 0) { throw 'Radar patch does not match this source revision.' }
+          git apply $patchPath
+          if ($LASTEXITCODE -ne 0) { throw 'Could not apply radar patch.' }
+
+      - name: Apply read-only minimap diagnostic counters
+        shell: pwsh
+        run: |
+          $diagnosticPatch = @'
+          diff --git a/src/GrimDawnBridge/MinimapProjection.h b/src/GrimDawnBridge/MinimapProjection.h
+          index d3fbf13..3d447d9 100644
+          --- a/src/GrimDawnBridge/MinimapProjection.h
+          +++ b/src/GrimDawnBridge/MinimapProjection.h
+          @@ -20,12 +20,22 @@ namespace MinimapProjection
+               inline thread_local void* currentMap = nullptr;
+               inline thread_local const float* currentOffset = nullptr;
+               inline void (*onRendered)(void*) = nullptr;
+          +    // Diagnostic-only counters; these never relax a compatibility guard.
+          +    // Sample stages: 0=not reached, 1=not ready, 2=vtable, 3=visibility,
+          +    // 4=closed mode, 5=region, 6=camera mode, 7=nonfinite,
+          +    // 8=geometry, 9=memory fault, 10=valid.
+          +    inline std::atomic<unsigned long long> renderCalls{0}, sampleCalls{0}, lastRenderTick{0};
+          +    inline std::atomic<unsigned int> sampleStage{0}, observedVisible{0}, observedRegion{0};
+          +    inline std::atomic<unsigned long long> observedVtableRva{0};
+          +    inline std::atomic<int> observedMode{-1}, observedCameraMode{-1};
+           
+               template<typename T> T Field(const void* object, size_t offset)
+               { return *reinterpret_cast<const T*>(static_cast<const unsigned char*>(object) + offset); }
+           
+               inline void __fastcall RenderHook(void* map, void* canvas, const float* offset)
+               {
+          +        renderCalls.fetch_add(1, std::memory_order_relaxed);
+          +        lastRenderTick.store(GetTickCount64(), std::memory_order_relaxed);
+                   const auto previousMap = currentMap;
+                   const auto previousOffset = currentOffset;
+                   currentMap = map; currentOffset = offset;
+          @@ -93,16 +103,31 @@ namespace MinimapProjection
+               // origin world X/Z, origin circle ratios X/Y, X basis X/Y, Z basis X/Y.
+               inline bool Sample(float left, float top, float diameter, float canvasX, float canvasY, std::array<float, 8>& result)
+               {
+          +        sampleCalls.fetch_add(1, std::memory_order_relaxed);
+          +        sampleStage.store(1, std::memory_order_relaxed);
+                   if (!available || !currentMap || !currentOffset) return false;
+                   __try
+                   {
+                       const auto map = static_cast<const unsigned char*>(currentMap);
+          -            if (Field<void*>(map, 0) != executable + mapVtableRva || !Field<unsigned char>(map, 0x161) ||
+          -                Field<int>(map, 0x38) == 2) return false; // The native render skips mode 2 (closed).
+          +            const auto actualVtable = Field<void*>(map, 0);
+          +            observedVtableRva.store(reinterpret_cast<uintptr_t>(actualVtable) -
+          +                reinterpret_cast<uintptr_t>(executable), std::memory_order_relaxed);
+          +            if (actualVtable != executable + mapVtableRva)
+          +            { sampleStage.store(2, std::memory_order_relaxed); return false; }
+          +            const auto visible = Field<unsigned char>(map, 0x161);
+          +            observedVisible.store(visible, std::memory_order_relaxed);
+          +            if (!visible) { sampleStage.store(3, std::memory_order_relaxed); return false; }
+          +            const auto mode = Field<int>(map, 0x38);
+          +            observedMode.store(mode, std::memory_order_relaxed);
+          +            if (mode == 2) { sampleStage.store(4, std::memory_order_relaxed); return false; }
+                       auto region = Field<void*>(map, 0x1C0);
+          +            observedRegion.store(region != nullptr, std::memory_order_relaxed);
+                       auto camera = map + 0x170;
+                       auto viewport = map + 0x1C8;
+          -            if (!region || Field<int>(camera, 0) != 1) return false; // Orthographic only.
+          +            if (!region) { sampleStage.store(5, std::memory_order_relaxed); return false; }
+          +            const auto cameraMode = Field<int>(camera, 0);
+          +            observedCameraMode.store(cameraMode, std::memory_order_relaxed);
+          +            if (cameraMode != 1) { sampleStage.store(6, std::memory_order_relaxed); return false; }
+                       float origin[3] = { Field<float>(camera, 0x28), 0, Field<float>(camera, 0x30) };
+                       float xPoint[3] = { origin[0] + 16, 0, origin[2] };
+                       float zPoint[3] = { origin[0], 0, origin[2] + 16 };
+          @@ -119,13 +144,16 @@ namespace MinimapProjection
+                           (p[1] + Field<float>(map, 0xAC8) + currentOffset[1] + canvasY - top - radius) / radius,
+                           (x[0] - p[0]) / (16 * radius), (x[1] - p[1]) / (16 * radius),
+                           (z[0] - p[0]) / (16 * radius), (z[1] - p[1]) / (16 * radius) };
+          -            for (auto value : result) if (!std::isfinite(value)) return false;
+          +            for (auto value : result) if (!std::isfinite(value))
+          +            { sampleStage.store(7, std::memory_order_relaxed); return false; }
+                       const float xs = hypotf(result[4], result[5]), zs = hypotf(result[6], result[7]);
+                       const bool valid = xs >= .001f && xs <= 1 && zs >= .001f && zs <= 1 &&
+                           fabsf(xs - zs) < xs * .02f && fabsf(result[4] * result[6] + result[5] * result[7]) < xs * zs * .02f &&
+                           fabsf(result[2]) < 2 && fabsf(result[3]) < 2;
+          +            sampleStage.store(valid ? 10 : 8, std::memory_order_relaxed);
+                       return valid;
+                   }
+          -        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+          +        __except (EXCEPTION_EXECUTE_HANDLER)
+          +        { sampleStage.store(9, std::memory_order_relaxed); return false; }
+               }
+           }
+          diff --git a/src/GrimDawnBridge/MinimapTelemetry.h b/src/GrimDawnBridge/MinimapTelemetry.h
+          index 725949d..258ee69 100644
+          --- a/src/GrimDawnBridge/MinimapTelemetry.h
+          +++ b/src/GrimDawnBridge/MinimapTelemetry.h
+          @@ -31,6 +31,8 @@ namespace MinimapTelemetry
+               inline unsigned long long frameContext = 0;
+               inline unsigned long long nextFrameContext = 0;
+               inline void* lastFrameRegion = nullptr;
+          +    inline std::atomic<unsigned long long> observeCalls{0}, lastMapBoundsAge{0};
+          +    inline std::atomic<unsigned int> lastMapBoundsFresh{0};
+               using FrameCallback = void(*)(void*, const std::array<float, 6>&, const std::array<float, 8>&, unsigned long long);
+               inline std::atomic<FrameCallback> onFrame{nullptr};
+           
+          @@ -86,11 +88,15 @@ namespace MinimapTelemetry
+               // the end of the map render and publish them as one immutable frame.
+               inline void ObserveMap(void* canvas)
+               {
+          +        observeCalls.fetch_add(1, std::memory_order_relaxed);
+                   std::array<float, 6> frameBounds{};
+                   AcquireSRWLockShared(&lock);
+                   frameBounds = bounds;
+          -        const bool fresh = sampledAt != 0 && GetTickCount64() - sampledAt < 150;
+          +        const auto age = sampledAt ? GetTickCount64() - sampledAt : 999999ULL;
+          +        const bool fresh = sampledAt != 0 && age < 150;
+                   ReleaseSRWLockShared(&lock);
+          +        lastMapBoundsAge.store(age, std::memory_order_relaxed);
+          +        lastMapBoundsFresh.store(fresh ? 1u : 0u, std::memory_order_relaxed);
+                   std::array<float, 8> transform{};
+                   const float offsetX = *reinterpret_cast<const float*>(static_cast<unsigned char*>(canvas) + canvasOffsetX);
+                   const float offsetY = *reinterpret_cast<const float*>(static_cast<unsigned char*>(canvas) + canvasOffsetY);
+          diff --git a/src/GrimDawnBridge/Bridge.cpp b/src/GrimDawnBridge/Bridge.cpp
+          index 5194108..355f5ae 100644
+          --- a/src/GrimDawnBridge/Bridge.cpp
+          +++ b/src/GrimDawnBridge/Bridge.cpp
+          @@ -1640,6 +1640,23 @@ namespace
+                       }
+                       Reply(pipe, response); return;
+                   }
+          +        if (strcmp(line, "MINIMAP\tDIAG") == 0)
+          +        {
+          +            const auto lastRender = MinimapProjection::lastRenderTick.load();
+          +            const auto renderAge = lastRender ? GetTickCount64() - lastRender : 999999ULL;
+          +            char response[512]{};
+          +            sprintf_s(response,
+          +                "OK MINIMAP_DIAG RENDER=%llu RENDER_AGE=%llu OBSERVE=%llu SAMPLE=%llu STAGE=%u VT=0x%llx EXPECT=0x%llx VISIBLE=%u MODE=%d REGION=%u CAMERA=%d BOUNDS_AGE=%llu FRESH=%u",
+          +                MinimapProjection::renderCalls.load(), renderAge,
+          +                MinimapTelemetry::observeCalls.load(),
+          +                MinimapProjection::sampleCalls.load(), MinimapProjection::sampleStage.load(),
+          +                MinimapProjection::observedVtableRva.load(),
+          +                static_cast<unsigned long long>(MinimapProjection::mapVtableRva),
+          +                MinimapProjection::observedVisible.load(), MinimapProjection::observedMode.load(),
+          +                MinimapProjection::observedRegion.load(), MinimapProjection::observedCameraMode.load(),
+          +                MinimapTelemetry::lastMapBoundsAge.load(), MinimapTelemetry::lastMapBoundsFresh.load());
+          +            Reply(pipe, response); return;
+          +        }
+                   if (strcmp(line, "MINIMAP\tBOUNDS") == 0)
+                   {
+                       std::array<float, 6> bounds{};
+          '@
+          $patchPath = Join-Path $env:RUNNER_TEMP 'gdcompanion-1312-diag.patch'
+          [System.IO.File]::WriteAllText($patchPath, $diagnosticPatch + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+          git apply --check $patchPath
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic patch does not match this source revision.' }
+          git apply $patchPath
+          if ($LASTEXITCODE -ne 0) { throw 'Could not apply diagnostic patch.' }
+
+      - name: Build Windows x64 candidate (no game tests)
+        shell: pwsh
+        run: |
+          .\scripts\build.ps1 -Architecture x64 -SkipTests -DestinationSuffix '-1312diag'
+          if ($LASTEXITCODE -ne 0) { throw 'GDCompanion build failed.' }
+
+      - name: Upload unverified executable package
+        uses: actions/upload-artifact@v4
+        with:
+          name: GDCompanion-1.3.1.2-radar-DIAGNOSTIC-UNVERIFIED
+          path: build/GDCompanion-v2.3.94-win-x64.zip
+          if-no-files-found: error
+          retention-days: 14
