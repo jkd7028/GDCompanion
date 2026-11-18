@@ -1,0 +1,491 @@
+name: GDCompanion 1.3.1.2 Korean item search (x64)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-x64:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Apply radar-only 1.3.1.2 source patch
+        shell: pwsh
+        run: |
+          $patchText = @'
+          diff --git a/src/GrimDawnBridge/MinimapProjection.h b/src/GrimDawnBridge/MinimapProjection.h
+          index 61bd7e6..d3fbf13 100644
+          --- a/src/GrimDawnBridge/MinimapProjection.h
+          +++ b/src/GrimDawnBridge/MinimapProjection.h
+          @@ -67,6 +67,18 @@ namespace MinimapProjection
+                           renderRva = 0x1769A0;
+                           mapVtableRva = 0x3159E0;
+                       }
+          +            else if (SupportedBuilds::ExactIdentity(reinterpret_cast<HMODULE>(executable), 0x6AF77535, 0x485000) &&
+          +                // 1.3.1.2: fingerprints from the user's loaded x64 executable,
+          +                // not the Steam-protected on-disk .text section.
+          +                Fingerprint(0x176C10, 0x410, 0xE1F7913DBFDD2586ULL) &&
+          +                Fingerprint(0x175F70, 0x470, 0x34500D8D8917A636ULL))
+          +            {
+          +                // The candidate map vtable has Map's destructor, render and
+          +                // update methods at adjacent slots. The Sample() object/layout
+          +                // guards must still pass in-game; otherwise radar remains off.
+          +                renderRva = 0x176C10;
+          +                mapVtableRva = 0x316A90;
+          +            }
+                       supported = project && worldCtor && worldPosition && renderRva && mapVtableRva &&
+                           dos->e_magic == IMAGE_DOS_SIGNATURE && pe->Signature == IMAGE_NT_SIGNATURE;
+                   }
+          diff --git a/src/GrimDawnBridge/RadarCanvas.h b/src/GrimDawnBridge/RadarCanvas.h
+          index f07cc5b..ab156ec 100644
+          --- a/src/GrimDawnBridge/RadarCanvas.h
+          +++ b/src/GrimDawnBridge/RadarCanvas.h
+          @@ -114,7 +114,11 @@ namespace RadarCanvas
+               }
+               inline void Initialize(HMODULE engine)
+               {
+          -        if (!MinimapProjection::available || SupportedBuilds::Engine(engine) == SupportedBuilds::Build::Unknown) return;
+          +        // 1.3.1.2 is admitted for the radar canvas only; character-changing
+          +        // utilities retain their independently audited SupportedBuilds gates.
+          +        if (!MinimapProjection::available ||
+          +            (SupportedBuilds::Engine(engine) == SupportedBuilds::Build::Unknown &&
+          +             !SupportedBuilds::ExactIdentity(engine, 0x6AF7742E, 0x450000))) return;
+                   fan = reinterpret_cast<FanFn>(GetProcAddress(engine, "?RenderTriFan@GraphicsCanvas@GAME@@QEAAXAEBV?$vector@VVec2@GAME@@@mem@@AEBVColor@2@@Z"));
+                   rectangle = reinterpret_cast<RectFn>(GetProcAddress(engine, "?RenderRect@GraphicsCanvas@GAME@@QEAAXAEBVRect@2@AEBVColor@2@@Z"));
+                   text = reinterpret_cast<TextFn>(GetProcAddress(engine, "?RenderColoredText2d@GraphicsCanvas@GAME@@QEAAXHHAEBV?$basic_string@GU?$char_traits@G@std@@V?$allocator@G@2@@std@@AEBV?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@4@AEBVColor@2@W4FontLayout@2@@Z"));
+          diff --git a/src/GrimDawnBridge/SupportedBuilds.h b/src/GrimDawnBridge/SupportedBuilds.h
+          index 389d7b4..560549e 100644
+          --- a/src/GrimDawnBridge/SupportedBuilds.h
+          +++ b/src/GrimDawnBridge/SupportedBuilds.h
+          @@ -23,6 +23,21 @@ namespace SupportedBuilds
+                   return Build::Unknown;
+               }
+           
+          +    // A narrowly scoped identity check for a feature that has independently
+          +    // verified code/layout guards. Do not add a new global Build enum value
+          +    // until all other architecture-specific capabilities have been audited.
+          +    inline bool ExactIdentity(HMODULE module, DWORD timestamp, DWORD imageSize)
+          +    {
+          +        if (!module) return false;
+          +        const auto bytes = reinterpret_cast<const unsigned char*>(module);
+          +        const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(bytes);
+          +        if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
+          +        const auto pe = reinterpret_cast<const IMAGE_NT_HEADERS64*>(bytes + dos->e_lfanew);
+          +        return pe->Signature == IMAGE_NT_SIGNATURE &&
+          +            pe->FileHeader.TimeDateStamp == timestamp &&
+          +            pe->OptionalHeader.SizeOfImage == imageSize;
+          +    }
+          +
+               inline Build Executable(HMODULE module) { return Identify(module, 0x6A85FBEC, 0x482000, 0x6AC7F680, 0x482000); }
+               inline Build Engine(HMODULE module) { return Identify(module, 0x6A85FB5B, 0x450000, 0x6AC7F5F7, 0x450000); }
+               inline Build Game(HMODULE module) { return Identify(module, 0x6A85FBB3, 0xAB5000, 0x6AC7F64B, 0xAE6000); }
+          '@
+          $patchPath = Join-Path $env:RUNNER_TEMP 'gdcompanion-1312-radar.patch'
+          [System.IO.File]::WriteAllText($patchPath, $patchText + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+          git apply --check $patchPath
+          if ($LASTEXITCODE -ne 0) { throw 'Radar patch does not match this source revision.' }
+          git apply $patchPath
+          if ($LASTEXITCODE -ne 0) { throw 'Could not apply radar patch.' }
+
+      - name: Apply read-only minimap diagnostic counters
+        shell: pwsh
+        run: |
+          $diagnosticPatch = @'
+          diff --git a/src/GrimDawnBridge/MinimapProjection.h b/src/GrimDawnBridge/MinimapProjection.h
+          index d3fbf13..3d447d9 100644
+          --- a/src/GrimDawnBridge/MinimapProjection.h
+          +++ b/src/GrimDawnBridge/MinimapProjection.h
+          @@ -20,12 +20,22 @@ namespace MinimapProjection
+               inline thread_local void* currentMap = nullptr;
+               inline thread_local const float* currentOffset = nullptr;
+               inline void (*onRendered)(void*) = nullptr;
+          +    // Diagnostic-only counters; these never relax a compatibility guard.
+          +    // Sample stages: 0=not reached, 1=not ready, 2=vtable, 3=visibility,
+          +    // 4=closed mode, 5=region, 6=camera mode, 7=nonfinite,
+          +    // 8=geometry, 9=memory fault, 10=valid.
+          +    inline std::atomic<unsigned long long> renderCalls{0}, sampleCalls{0}, lastRenderTick{0};
+          +    inline std::atomic<unsigned int> sampleStage{0}, observedVisible{0}, observedRegion{0};
+          +    inline std::atomic<unsigned long long> observedVtableRva{0};
+          +    inline std::atomic<int> observedMode{-1}, observedCameraMode{-1};
+           
+               template<typename T> T Field(const void* object, size_t offset)
+               { return *reinterpret_cast<const T*>(static_cast<const unsigned char*>(object) + offset); }
+           
+               inline void __fastcall RenderHook(void* map, void* canvas, const float* offset)
+               {
+          +        renderCalls.fetch_add(1, std::memory_order_relaxed);
+          +        lastRenderTick.store(GetTickCount64(), std::memory_order_relaxed);
+                   const auto previousMap = currentMap;
+                   const auto previousOffset = currentOffset;
+                   currentMap = map; currentOffset = offset;
+          @@ -93,16 +103,31 @@ namespace MinimapProjection
+               // origin world X/Z, origin circle ratios X/Y, X basis X/Y, Z basis X/Y.
+               inline bool Sample(float left, float top, float diameter, float canvasX, float canvasY, std::array<float, 8>& result)
+               {
+          +        sampleCalls.fetch_add(1, std::memory_order_relaxed);
+          +        sampleStage.store(1, std::memory_order_relaxed);
+                   if (!available || !currentMap || !currentOffset) return false;
+                   __try
+                   {
+                       const auto map = static_cast<const unsigned char*>(currentMap);
+          -            if (Field<void*>(map, 0) != executable + mapVtableRva || !Field<unsigned char>(map, 0x161) ||
+          -                Field<int>(map, 0x38) == 2) return false; // The native render skips mode 2 (closed).
+          +            const auto actualVtable = Field<void*>(map, 0);
+          +            observedVtableRva.store(reinterpret_cast<uintptr_t>(actualVtable) -
+          +                reinterpret_cast<uintptr_t>(executable), std::memory_order_relaxed);
+          +            if (actualVtable != executable + mapVtableRva)
+          +            { sampleStage.store(2, std::memory_order_relaxed); return false; }
+          +            const auto visible = Field<unsigned char>(map, 0x161);
+          +            observedVisible.store(visible, std::memory_order_relaxed);
+          +            if (!visible) { sampleStage.store(3, std::memory_order_relaxed); return false; }
+          +            const auto mode = Field<int>(map, 0x38);
+          +            observedMode.store(mode, std::memory_order_relaxed);
+          +            if (mode == 2) { sampleStage.store(4, std::memory_order_relaxed); return false; }
+                       auto region = Field<void*>(map, 0x1C0);
+          +            observedRegion.store(region != nullptr, std::memory_order_relaxed);
+                       auto camera = map + 0x170;
+                       auto viewport = map + 0x1C8;
+          -            if (!region || Field<int>(camera, 0) != 1) return false; // Orthographic only.
+          +            if (!region) { sampleStage.store(5, std::memory_order_relaxed); return false; }
+          +            const auto cameraMode = Field<int>(camera, 0);
+          +            observedCameraMode.store(cameraMode, std::memory_order_relaxed);
+          +            if (cameraMode != 1) { sampleStage.store(6, std::memory_order_relaxed); return false; }
+                       float origin[3] = { Field<float>(camera, 0x28), 0, Field<float>(camera, 0x30) };
+                       float xPoint[3] = { origin[0] + 16, 0, origin[2] };
+                       float zPoint[3] = { origin[0], 0, origin[2] + 16 };
+          @@ -119,13 +144,16 @@ namespace MinimapProjection
+                           (p[1] + Field<float>(map, 0xAC8) + currentOffset[1] + canvasY - top - radius) / radius,
+                           (x[0] - p[0]) / (16 * radius), (x[1] - p[1]) / (16 * radius),
+                           (z[0] - p[0]) / (16 * radius), (z[1] - p[1]) / (16 * radius) };
+          -            for (auto value : result) if (!std::isfinite(value)) return false;
+          +            for (auto value : result) if (!std::isfinite(value))
+          +            { sampleStage.store(7, std::memory_order_relaxed); return false; }
+                       const float xs = hypotf(result[4], result[5]), zs = hypotf(result[6], result[7]);
+                       const bool valid = xs >= .001f && xs <= 1 && zs >= .001f && zs <= 1 &&
+                           fabsf(xs - zs) < xs * .02f && fabsf(result[4] * result[6] + result[5] * result[7]) < xs * zs * .02f &&
+                           fabsf(result[2]) < 2 && fabsf(result[3]) < 2;
+          +            sampleStage.store(valid ? 10 : 8, std::memory_order_relaxed);
+                       return valid;
+                   }
+          -        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+          +        __except (EXCEPTION_EXECUTE_HANDLER)
+          +        { sampleStage.store(9, std::memory_order_relaxed); return false; }
+               }
+           }
+          diff --git a/src/GrimDawnBridge/MinimapTelemetry.h b/src/GrimDawnBridge/MinimapTelemetry.h
+          index 725949d..258ee69 100644
+          --- a/src/GrimDawnBridge/MinimapTelemetry.h
+          +++ b/src/GrimDawnBridge/MinimapTelemetry.h
+          @@ -31,6 +31,8 @@ namespace MinimapTelemetry
+               inline unsigned long long frameContext = 0;
+               inline unsigned long long nextFrameContext = 0;
+               inline void* lastFrameRegion = nullptr;
+          +    inline std::atomic<unsigned long long> observeCalls{0}, lastMapBoundsAge{0};
+          +    inline std::atomic<unsigned int> lastMapBoundsFresh{0};
+               using FrameCallback = void(*)(void*, const std::array<float, 6>&, const std::array<float, 8>&, unsigned long long);
+               inline std::atomic<FrameCallback> onFrame{nullptr};
+           
+          @@ -86,11 +88,15 @@ namespace MinimapTelemetry
+               // the end of the map render and publish them as one immutable frame.
+               inline void ObserveMap(void* canvas)
+               {
+          +        observeCalls.fetch_add(1, std::memory_order_relaxed);
+                   std::array<float, 6> frameBounds{};
+                   AcquireSRWLockShared(&lock);
+                   frameBounds = bounds;
+          -        const bool fresh = sampledAt != 0 && GetTickCount64() - sampledAt < 150;
+          +        const auto age = sampledAt ? GetTickCount64() - sampledAt : 999999ULL;
+          +        const bool fresh = sampledAt != 0 && age < 150;
+                   ReleaseSRWLockShared(&lock);
+          +        lastMapBoundsAge.store(age, std::memory_order_relaxed);
+          +        lastMapBoundsFresh.store(fresh ? 1u : 0u, std::memory_order_relaxed);
+                   std::array<float, 8> transform{};
+                   const float offsetX = *reinterpret_cast<const float*>(static_cast<unsigned char*>(canvas) + canvasOffsetX);
+                   const float offsetY = *reinterpret_cast<const float*>(static_cast<unsigned char*>(canvas) + canvasOffsetY);
+          diff --git a/src/GrimDawnBridge/Bridge.cpp b/src/GrimDawnBridge/Bridge.cpp
+          index 5194108..355f5ae 100644
+          --- a/src/GrimDawnBridge/Bridge.cpp
+          +++ b/src/GrimDawnBridge/Bridge.cpp
+          @@ -1640,6 +1640,23 @@ namespace
+                       }
+                       Reply(pipe, response); return;
+                   }
+          +        if (strcmp(line, "MINIMAP\tDIAG") == 0)
+          +        {
+          +            const auto lastRender = MinimapProjection::lastRenderTick.load();
+          +            const auto renderAge = lastRender ? GetTickCount64() - lastRender : 999999ULL;
+          +            char response[512]{};
+          +            sprintf_s(response,
+          +                "OK MINIMAP_DIAG RENDER=%llu RENDER_AGE=%llu OBSERVE=%llu SAMPLE=%llu STAGE=%u VT=0x%llx EXPECT=0x%llx VISIBLE=%u MODE=%d REGION=%u CAMERA=%d BOUNDS_AGE=%llu FRESH=%u",
+          +                MinimapProjection::renderCalls.load(), renderAge,
+          +                MinimapTelemetry::observeCalls.load(),
+          +                MinimapProjection::sampleCalls.load(), MinimapProjection::sampleStage.load(),
+          +                MinimapProjection::observedVtableRva.load(),
+          +                static_cast<unsigned long long>(MinimapProjection::mapVtableRva),
+          +                MinimapProjection::observedVisible.load(), MinimapProjection::observedMode.load(),
+          +                MinimapProjection::observedRegion.load(), MinimapProjection::observedCameraMode.load(),
+          +                MinimapTelemetry::lastMapBoundsAge.load(), MinimapTelemetry::lastMapBoundsFresh.load());
+          +            Reply(pipe, response); return;
+          +        }
+                   if (strcmp(line, "MINIMAP\tBOUNDS") == 0)
+                   {
+                       std::array<float, 6> bounds{};
+          '@
+          $patchPath = Join-Path $env:RUNNER_TEMP 'gdcompanion-1312-diag.patch'
+          [System.IO.File]::WriteAllText($patchPath, $diagnosticPatch + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+          git apply --check $patchPath
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic patch does not match this source revision.' }
+          git apply $patchPath
+          if ($LASTEXITCODE -ne 0) { throw 'Could not apply diagnostic patch.' }
+
+      - name: Apply Korean item search and display patch
+        shell: pwsh
+        run: |
+          $koreanPatch = @'
+          diff --git a/src/GrimDawnCompanion.Core/Models.cs b/src/GrimDawnCompanion.Core/Models.cs
+          index 14b9043..9f2160b 100644
+          --- a/src/GrimDawnCompanion.Core/Models.cs
+          +++ b/src/GrimDawnCompanion.Core/Models.cs
+          @@ -30,6 +30,8 @@ public sealed record ItemRecord(
+               string InternalClass)
+           {
+               public bool NameUnavailable { get; init; }
+          +    public string? KoreanName { get; init; }
+          +    public string DisplayName => string.IsNullOrWhiteSpace(KoreanName) ? Name : $"{KoreanName} ({Name})";
+           }
+           
+           public sealed record QuestTokenRecord(string Name, string Source, int References);
+          diff --git a/src/GrimDawnCompanion.Core/CatalogService.cs b/src/GrimDawnCompanion.Core/CatalogService.cs
+          index cf41b1f..d3758cf 100644
+          --- a/src/GrimDawnCompanion.Core/CatalogService.cs
+          +++ b/src/GrimDawnCompanion.Core/CatalogService.cs
+          @@ -42,6 +42,51 @@ public sealed partial class CatalogService
+                   return null;
+               }
+           
+          +    // Read only the installed Korean text archives. Do not replace the English
+          +    // catalog or change DBR record paths used by the game's spawn API.
+          +    public static int ApplyKoreanItemNames(GameInstallation game, CatalogDocument document)
+          +    {
+          +        var tags = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+          +        foreach (var archive in GameLocator.GetInstalledArchives(game))
+          +        {
+          +            if (archive.TextPath is not { } englishPath) continue;
+          +            var directory = Path.GetDirectoryName(englishPath);
+          +            if (string.IsNullOrEmpty(directory)) continue;
+          +            var koreanPath = Path.Combine(directory, "Text_KO.arc");
+          +            if (!File.Exists(koreanPath)) continue;
+          +            try
+          +            {
+          +                foreach (var pair in ArcReader.ReadTags(koreanPath)) tags[pair.Key] = pair.Value;
+          +            }
+          +            catch (IOException) { } // Keep the English catalog if an optional ARC is unreadable.
+          +            catch (UnauthorizedAccessException) { }
+          +            catch (InvalidDataException) { }
+          +        }
+          +        return ApplyKoreanTags(document, tags);
+          +    }
+          +
+          +    // Testable name-tag join. No guessing by English name and no changes to
+          +    // the item path, source, affix choices, or existing English display name.
+          +    public static int ApplyKoreanTags(CatalogDocument document, IReadOnlyDictionary<string, string> tags)
+          +    {
+          +        var matched = 0;
+          +        for (var i = 0; i < document.Items.Count; i++)
+          +        {
+          +            var item = document.Items[i];
+          +            string? korean = null;
+          +            if (!string.IsNullOrWhiteSpace(item.NameTag) &&
+          +                tags.TryGetValue(item.NameTag, out var raw))
+          +            {
+          +                var clean = CleanMarkup(raw);
+          +                if (clean.Length > 0 && !string.Equals(clean, item.Name, StringComparison.OrdinalIgnoreCase))
+          +                    korean = clean;
+          +            }
+          +            if (korean is not null) matched++;
+          +            if (item.KoreanName != korean) document.Items[i] = item with { KoreanName = korean };
+          +        }
+          +        return matched;
+          +    }
+          +
+               public static async Task<string> ComputeSourceFingerprintAsync(GameInstallation game, CancellationToken cancellationToken = default)
+               {
+                   var sources = new List<CatalogSource>();
+          diff --git a/src/GrimDawnCompanion.App/MainViewModel.cs b/src/GrimDawnCompanion.App/MainViewModel.cs
+          index 0e2108d..3730f24 100644
+          --- a/src/GrimDawnCompanion.App/MainViewModel.cs
+          +++ b/src/GrimDawnCompanion.App/MainViewModel.cs
+          @@ -155,12 +155,15 @@ public sealed class MainViewModel : INotifyPropertyChanged
+                   if (SelectedSource != "All Content" && item.Source != SelectedSource) return false;
+                   if (string.IsNullOrWhiteSpace(SearchText)) return true;
+                   return item.Name.Contains(SearchText, StringComparison.CurrentCultureIgnoreCase) ||
+          +               (item.KoreanName?.Contains(SearchText, StringComparison.CurrentCultureIgnoreCase) == true) ||
+                          item.RecordPath.Contains(SearchText, StringComparison.OrdinalIgnoreCase) ||
+                          item.Classification.Contains(SearchText, StringComparison.OrdinalIgnoreCase);
+               }
+           
+               private static bool Matches(ItemRecord item, string search) => string.IsNullOrWhiteSpace(search) ||
+          -        item.Name.Contains(search, StringComparison.CurrentCultureIgnoreCase) || item.RecordPath.Contains(search, StringComparison.OrdinalIgnoreCase) ||
+          +        item.Name.Contains(search, StringComparison.CurrentCultureIgnoreCase) ||
+          +        (item.KoreanName?.Contains(search, StringComparison.CurrentCultureIgnoreCase) == true) ||
+          +        item.RecordPath.Contains(search, StringComparison.OrdinalIgnoreCase) ||
+                   item.Classification.Contains(search, StringComparison.OrdinalIgnoreCase) || item.Source.Contains(search, StringComparison.OrdinalIgnoreCase);
+           
+               private bool Set<T>(ref T field, T value, [CallerMemberName] string? property = null)
+          diff --git a/src/GrimDawnCompanion.App/MainWindow.xaml.cs b/src/GrimDawnCompanion.App/MainWindow.xaml.cs
+          index a8b1dea..c8f8b82 100644
+          --- a/src/GrimDawnCompanion.App/MainWindow.xaml.cs
+          +++ b/src/GrimDawnCompanion.App/MainWindow.xaml.cs
+          @@ -156,6 +156,7 @@ public partial class MainWindow : Window
+                       _document = await _catalog.LoadAsync(cancellationToken: _lifetime.Token);
+                       if (_document is not null)
+                       {
+          +                await EnrichKoreanCatalogAsync(_document);
+                           _viewModel.SetCatalog(_document);
+                           SetStatus("Catalog loaded", $"{_document.Items.Count:N0} items available while updates are checked.", 0);
+                       }
+          @@ -183,6 +184,13 @@ public partial class MainWindow : Window
+                   finally { _viewModel.IsBusy = false; }
+               }
+           
+          +    private async Task EnrichKoreanCatalogAsync(CatalogDocument document)
+          +    {
+          +        var game = _game;
+          +        if (game is null) return;
+          +        await Task.Run(() => CatalogService.ApplyKoreanItemNames(game, document), _lifetime.Token);
+          +    }
+          +
+               private async Task VerifyCompatibilityAsync()
+               {
+                   if (_game is null) return;
+          @@ -202,6 +210,7 @@ public partial class MainWindow : Window
+                   {
+                       var progress = new Progress<CatalogProgress>(value => SetStatus(value.Stage, value.Detail, value.Percent));
+                       _document = await _catalog.RebuildAsync(_game, progress: progress, cancellationToken: _lifetime.Token);
+          +            await EnrichKoreanCatalogAsync(_document);
+                       _viewModel.SetCatalog(_document);
+                       SetStatus("Catalog ready", $"Verified {_document.Items.Count:N0} records across {_document.Sources.Count} installed content archives.", 100);
+                   }
+          @@ -333,12 +342,12 @@ public partial class MainWindow : Window
+                       if(_viewModel.SelectedPrefix.RecordPath.Length>0 || _viewModel.SelectedSuffix.RecordPath.Length>0)
+                       {
+                           await _bridge.SpawnAffixedItemAsync(_viewModel.SelectedItem,_viewModel.SelectedPrefix,_viewModel.SelectedSuffix,quantity,_viewModel.AffixIndex,_lifetime.Token);
+          -                SetStatus("Affixed items created",$"{quantity} × {_viewModel.SelectedItem.Name}. Check inventory or nearby ground if full.",100);
+          +                SetStatus("Affixed items created",$"{quantity} × {_viewModel.SelectedItem.DisplayName}. Check inventory or nearby ground if full.",100);
+                           return;
+                       }
+                       var result = await _bridge.SpawnItemAsync(_viewModel.SelectedItem, quantity, CompleteComponentBox.IsChecked == true, _lifetime.Token);
+                       if (!result.StartsWith("OK LUA", StringComparison.Ordinal)) throw new InvalidOperationException(result);
+          -            SetStatus("Items created", $"{quantity} × {_viewModel.SelectedItem.Name}. Check inventory or nearby ground if full.", 100);
+          +            SetStatus("Items created", $"{quantity} × {_viewModel.SelectedItem.DisplayName}. Check inventory or nearby ground if full.", 100);
+                   }
+                   catch (Exception ex) { MessageBox.Show(ex.Message, "Item spawning not completed", MessageBoxButton.OK, MessageBoxImage.Warning); }
+                   finally { _itemSpawnBusy=false;if(sender is Button button) button.IsEnabled=true; }
+          @@ -420,7 +429,7 @@ public partial class MainWindow : Window
+                   {
+                       var response = await _bridge.SpawnItemAsync(item, 1, false, _lifetime.Token);
+                       if (!response.StartsWith("QUEUED", StringComparison.Ordinal)) throw new InvalidOperationException(response);
+          -            SetStatus(title, $"{item.Name} • {detail}", 100);
+          +            SetStatus(title, $"{item.DisplayName} • {detail}", 100);
+                   }
+                   catch (Exception ex) { MessageBox.Show(ex.Message, "Item delivery not completed", MessageBoxButton.OK, MessageBoxImage.Warning); }
+               }
+          diff --git a/src/GrimDawnCompanion.App/MainWindow.xaml b/src/GrimDawnCompanion.App/MainWindow.xaml
+          index 6ab76fd..c013c9d 100644
+          --- a/src/GrimDawnCompanion.App/MainWindow.xaml
+          +++ b/src/GrimDawnCompanion.App/MainWindow.xaml
+          @@ -186,7 +186,7 @@
+                     <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="12"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+                     <Grid>
+                       <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="190"/><ColumnDefinition Width="190"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+          -            <TextBox Grid.Column="0" Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged}" ToolTip="Search item name, DBR path, or classification" Margin="0,0,10,0"/>
+          +            <TextBox Grid.Column="0" Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged}" ToolTip="Search Korean or English item name, DBR path, or classification" Margin="0,0,10,0"/>
+                       <ComboBox x:Name="CategoryFilter" Grid.Column="1" ItemsSource="{Binding Categories}" SelectedItem="{Binding SelectedCategory}" Margin="0,0,10,0"/>
+                       <ComboBox x:Name="SourceFilter" Grid.Column="2" ItemsSource="{Binding Sources}" SelectedItem="{Binding SelectedSource}" Margin="0,0,14,0"/>
+                       <TextBlock Grid.Column="3" Text="{Binding ItemCountText}" Foreground="{StaticResource SecondaryText}" VerticalAlignment="Center"/>
+          @@ -196,7 +196,7 @@
+                       <Border Style="{StaticResource Card}" Padding="0" ClipToBounds="True">
+                         <DataGrid ItemsSource="{Binding ItemsView}" SelectedItem="{Binding SelectedItem}" SelectionMode="Single" SelectionUnit="FullRow" AutoGenerateColumns="False">
+                           <DataGrid.Columns>
+          -                  <DataGridTextColumn Header="ITEM" Binding="{Binding Name}" Width="2*"/>
+          +                  <DataGridTextColumn Header="ITEM (KO / EN)" Binding="{Binding DisplayName}" Width="2*"/>
+                             <DataGridTextColumn Header="CATEGORY" Binding="{Binding Category}" Width="1.15*"/>
+                             <DataGridTextColumn Header="RARITY" Binding="{Binding Classification}" Width="0.8*"/>
+                             <DataGridTextColumn Header="SOURCE" Binding="{Binding Source}" Width="1.1*"/>
+          @@ -210,7 +210,7 @@
+                           <ScrollViewer VerticalScrollBarVisibility="Auto">
+                             <StackPanel>
+                               <TextBlock Text="SELECTED ITEM" FontWeight="Bold" FontSize="11" Foreground="{StaticResource Accent}"/>
+          -                    <TextBlock Text="{Binding SelectedItem.Name, TargetNullValue=Choose an item}" FontSize="22" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,10,0,18"/>
+          +                    <TextBlock Text="{Binding SelectedItem.DisplayName, TargetNullValue=Choose an item}" FontSize="22" FontWeight="SemiBold" TextWrapping="Wrap" Margin="0,10,0,18"/>
+                               <TextBlock Text="DBR Record" Foreground="{StaticResource SecondaryText}" FontSize="12"/>
+                               <Border Background="#09111F" CornerRadius="7" Padding="11" Margin="0,6,0,14">
+                                 <TextBlock Text="{Binding SelectedItem.RecordPath}" FontFamily="Cascadia Mono, Consolas" FontSize="11" TextWrapping="Wrap"/>
+          @@ -450,7 +450,7 @@
+                         <Border Style="{StaticResource Card}" Padding="0" ClipToBounds="True">
+                           <Grid><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                             <StackPanel Margin="18"><TextBlock Text="Crafting Blueprints" FontSize="19" FontWeight="SemiBold"/><TextBlock Text="Search installed recipes and spawn a blueprint. Use it from the character's inventory to learn it." Foreground="{StaticResource SecondaryText}" TextWrapping="Wrap" Margin="0,5,0,12"/><DockPanel><TextBlock DockPanel.Dock="Right" Text="{Binding BlueprintCountText}" Foreground="{StaticResource SecondaryText}" VerticalAlignment="Center" Margin="10,0,0,0"/><TextBox Text="{Binding BlueprintSearch, UpdateSourceTrigger=PropertyChanged}" ToolTip="Search blueprints"/></DockPanel></StackPanel>
+          -                  <DataGrid Grid.Row="1" ItemsSource="{Binding BlueprintsView}" SelectedItem="{Binding SelectedBlueprint}" AutoGenerateColumns="False"><DataGrid.Columns><DataGridTextColumn Header="BLUEPRINT" Binding="{Binding Name}" Width="2*"/><DataGridTextColumn Header="SOURCE" Binding="{Binding Source}" Width="*"/></DataGrid.Columns></DataGrid>
+          +                  <DataGrid Grid.Row="1" ItemsSource="{Binding BlueprintsView}" SelectedItem="{Binding SelectedBlueprint}" AutoGenerateColumns="False"><DataGrid.Columns><DataGridTextColumn Header="BLUEPRINT (KO / EN)" Binding="{Binding DisplayName}" Width="2*"/><DataGridTextColumn Header="SOURCE" Binding="{Binding Source}" Width="*"/></DataGrid.Columns></DataGrid>
+                             <StackPanel Grid.Row="2" Margin="18"><TextBlock Text="{Binding SelectedBlueprint.RecordPath}" FontFamily="Cascadia Mono, Consolas" Foreground="{StaticResource SecondaryText}" FontSize="11" TextWrapping="Wrap"/><Button Style="{StaticResource PrimaryButton}" Content="Spawn Selected Blueprint" Click="SpawnBlueprint" Margin="0,12,0,0"/></StackPanel>
+                           </Grid>
+                         </Border>
+          diff --git a/src/GrimDawnCompanion.Tests/CatalogFilterUiRegression.cs b/src/GrimDawnCompanion.Tests/CatalogFilterUiRegression.cs
+          index b29c918..17bc4fc 100644
+          --- a/src/GrimDawnCompanion.Tests/CatalogFilterUiRegression.cs
+          +++ b/src/GrimDawnCompanion.Tests/CatalogFilterUiRegression.cs
+          @@ -40,11 +40,22 @@ internal static class CatalogFilterUiRegression
+                           }
+                           Check("Startup");
+                           var catalog = new CatalogDocument { Items = [
+          -                    new ItemRecord("Sword", "sword.dbr", "Base Game", "Weapons", "Common", 1, "", ""),
+          +                    new ItemRecord("Sword", "sword.dbr", "Base Game", "Weapons", "Common", 1, "tagSword", ""),
+                               new ItemRecord("Hat", "hat.dbr", "DLC", "Armor", "Common", 1, "", "")
+                           ] };
+          +                var mapped = CatalogService.ApplyKoreanTags(catalog, new Dictionary<string, string> { ["tagSword"] = "^g철검" });
+          +                require(mapped == 1 && catalog.Items[0].KoreanName == "철검" &&
+          +                    catalog.Items[0].DisplayName == "철검 (Sword)" && catalog.Items[0].RecordPath == "sword.dbr",
+          +                    "Korean name joins by tag without modifying the spawn record path");
+                           vm.SetCatalog(catalog);
+                           Check("Catalog reload");
+          +                vm.SearchText = "철검";
+          +                require(vm.ItemsView.Cast<ItemRecord>().Single().RecordPath == "sword.dbr",
+          +                    "Korean item name filters to the original spawn record");
+          +                vm.SearchText = "sword";
+          +                require(vm.ItemsView.Cast<ItemRecord>().Single().RecordPath == "sword.dbr",
+          +                    "existing English item search remains available");
+          +                vm.SearchText = "";
+                           category.SelectedItem = "Weapons";
+                           source.SelectedItem = "Base Game";
+                           host.UpdateLayout();
+          '@
+          $patchPath = Join-Path $env:RUNNER_TEMP 'gdcompanion-1312-korean-items.patch'
+          [System.IO.File]::WriteAllText($patchPath, $koreanPatch + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
+          git apply --check $patchPath
+          if ($LASTEXITCODE -ne 0) { throw 'Korean item search patch does not match this source revision.' }
+          git apply $patchPath
+          if ($LASTEXITCODE -ne 0) { throw 'Could not apply Korean item search patch.' }
+
+      - name: Build Windows x64 candidate (no game tests)
+        shell: pwsh
+        run: |
+          .\scripts\build.ps1 -Architecture x64 -SkipTests -DestinationSuffix '-1312ko'
+          if ($LASTEXITCODE -ne 0) { throw 'GDCompanion build failed.' }
+
+      - name: Upload unverified executable package
+        uses: actions/upload-artifact@v4
+        with:
+          name: GDCompanion-1.3.1.2-RADAR-KOREAN-ITEMS-UNVERIFIED
+          path: build/GDCompanion-v2.3.94-win-x64.zip
+          if-no-files-found: error
+          retention-days: 14
